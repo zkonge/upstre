@@ -21,15 +21,6 @@ pub enum Error<E> {
     EndOfStream,
 }
 
-/// Define the retry logic while [`Stream`] ended.
-#[non_exhaustive]
-pub enum RetryPolicy {
-    /// rebuild the stream
-    Rebuild,
-    /// continue polling the stream
-    Continue,
-}
-
 /// Stores the latest value of a stream, with retry logic.
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
@@ -59,7 +50,6 @@ where
     EHFut: Future<Output = ()> + Send,
 {
     error_handler: EH,
-    retry_policy: RetryPolicy,
     sleep: Duration,
     _p: PhantomData<(E, EHFut)>,
 }
@@ -70,20 +60,12 @@ where
     E: Send,
     EHFut: Future<Output = ()> + Send,
 {
-    /// A callback that receives errors while [`Stream`] ended and decide the [`RetryPolicy`].
+    /// A callback that receives errors while [`Stream`] ended.
     pub fn new(error_handler: EH) -> Self {
         Self {
             error_handler,
-            retry_policy: RetryPolicy::Rebuild,
             sleep: DEFAULT_RETRY_GAP,
             _p: PhantomData,
-        }
-    }
-
-    pub fn retry_policy(self, retry_policy: RetryPolicy) -> Self {
-        Self {
-            retry_policy,
-            ..self
         }
     }
 
@@ -119,25 +101,15 @@ where
                 // prevent busy loop
                 sleep(self.sleep).await;
 
-                match self.retry_policy {
-                    RetryPolicy::Rebuild => (),
-                    // continue polling the stream, not quite useful since
-                    // the stream is already ended, but if the stream
-                    // could be resumed (like gRPC), it's useful.
-                    RetryPolicy::Continue => continue,
-                }
-
-                let new_stream = loop {
+                stream = loop {
                     match stream_maker().await {
-                        Ok(s) => break s,
+                        Ok(s) => break Box::pin(s),
                         Err(e) => {
                             (self.error_handler)(Error::Error(e)).await;
                             sleep(self.sleep).await;
                         }
                     }
                 };
-
-                stream = Box::pin(new_stream);
             }
         };
 
@@ -157,7 +129,6 @@ where
     fn default() -> Self {
         Self {
             error_handler: |_| ready(()),
-            retry_policy: RetryPolicy::Rebuild,
             sleep: DEFAULT_RETRY_GAP,
             _p: PhantomData,
         }
