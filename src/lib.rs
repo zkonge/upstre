@@ -22,6 +22,7 @@ pub enum Error<E> {
 }
 
 /// Stores the latest value of a stream, with retry logic.
+#[derive(Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
     aborter: AbortHandle,
@@ -40,6 +41,15 @@ impl<T: Send + Sync + 'static> Upstre<T> {
 impl<T: Send + Sync + 'static> Drop for Upstre<T> {
     fn drop(&mut self) {
         self.aborter.abort();
+    }
+}
+
+impl<T: Send + Sync + 'static> Clone for Upstre<T> {
+    fn clone(&self) -> Self {
+        Self {
+            place: self.place.clone(),
+            aborter: self.aborter.clone(),
+        }
     }
 }
 
