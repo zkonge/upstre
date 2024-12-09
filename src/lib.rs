@@ -6,7 +6,7 @@ use std::{
 };
 
 pub use arc_swap::{ArcSwap, Guard};
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, TryStreamExt};
 use thiserror::Error;
 use tokio::{task::AbortHandle, time::sleep};
 
@@ -21,7 +21,10 @@ pub enum Error<E> {
     EndOfStream,
 }
 
-/// Stores the latest value of a stream, with retry logic.
+/// Storing the fresh value of a stream.
+///
+/// Each time the stream ends or raises an error, the error handler will be called and
+/// the stream will be recreated.
 #[derive(Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
@@ -29,10 +32,17 @@ pub struct Upstre<T: Send + Sync + 'static> {
 }
 
 impl<T: Send + Sync + 'static> Upstre<T> {
+    /// Get the last value of the stream.
     pub fn value(&self) -> Guard<Arc<T>> {
         self.place.load()
     }
 
+    /// Get the container of the last value, preventing the the unnecessary [`Arc`] wrapper.
+    ///
+    /// The [`Arc<Upstre<T>>`] needs 3 dereferences to get the value,
+    /// while the [`Weak<ArcSwap<T>>`] one time less.
+    ///
+    /// But in such case, the [`Weak`] reference is not guaranteed to be valid.
     pub fn container(&self) -> Weak<ArcSwap<T>> {
         Arc::downgrade(&self.place)
     }
@@ -41,15 +51,6 @@ impl<T: Send + Sync + 'static> Upstre<T> {
 impl<T: Send + Sync + 'static> Drop for Upstre<T> {
     fn drop(&mut self) {
         self.aborter.abort();
-    }
-}
-
-impl<T: Send + Sync + 'static> Clone for Upstre<T> {
-    fn clone(&self) -> Self {
-        Self {
-            place: self.place.clone(),
-            aborter: self.aborter.clone(),
-        }
     }
 }
 
@@ -70,7 +71,7 @@ where
     E: Send,
     EHFut: Future<Output = ()> + Send,
 {
-    /// A callback that receives errors while [`Stream`] ended.
+    /// The error handler receives errors while [`Stream`] raises error or ends.
     pub fn new(error_handler: EH) -> Self {
         Self {
             error_handler,
@@ -79,19 +80,46 @@ where
         }
     }
 
+    /// Set the sleep duration between retries.
     pub fn sleep(self, dur: Duration) -> Self {
         Self { sleep: dur, ..self }
     }
 
+    /// Build the [`Upstre`].
+    ///
+    /// ```rust
+    /// use std::{
+    ///     convert::Infallible,
+    ///     future::{ready, Ready},
+    /// };
+    ///
+    /// use futures_util::stream::{once, Once};
+    ///
+    /// use upstre::UpstreBuilder;
+    ///
+    /// async fn make_stream() -> Result<Once<Ready<Result<(), Infallible>>>, Infallible> {
+    ///     Ok(once(ready(Ok(()))))
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let place = UpstreBuilder::default().build(make_stream).await.unwrap();
+    ///
+    /// assert_eq!(**place.value(), ());
+    /// # })
+    /// ```
     pub async fn build<F, Fut, S, T>(self, stream_maker: F) -> Result<Upstre<T>, Error<E>>
     where
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = Result<S, E>> + Send + 'static,
-        S: Stream<Item = T> + Send + 'static,
+        S: Stream<Item = Result<T, E>> + Send + 'static,
         T: Send + Sync + 'static,
     {
         let mut initial_stream = Box::pin(stream_maker().await.map_err(Error::Error)?);
-        let initial_value = initial_stream.next().await.ok_or(Error::EndOfStream)?;
+        let initial_value = initial_stream
+            .try_next()
+            .await
+            .map_err(Error::Error)?
+            .ok_or(Error::EndOfStream)?;
 
         let place = Arc::new(ArcSwap::from_pointee(initial_value));
         let place_cloned = place.clone();
@@ -100,13 +128,17 @@ where
             let mut stream = initial_stream;
 
             loop {
-                if let Some(v) = stream.next().await {
-                    place_cloned.store(Arc::new(v));
-                    continue;
-                }
+                let e = match stream.try_next().await {
+                    Ok(Some(v)) => {
+                        place_cloned.store(Arc::new(v));
+                        continue;
+                    }
+                    Ok(None) => Error::EndOfStream,
+                    Err(e) => Error::Error(e),
+                };
 
                 // call error handler, usually for logging
-                (self.error_handler)(Error::EndOfStream).await;
+                (self.error_handler)(e).await;
 
                 // prevent busy loop
                 sleep(self.sleep).await;
