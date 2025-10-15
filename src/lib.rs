@@ -23,7 +23,7 @@ pub enum Error<E> {
 
 /// Storing the fresh value of a stream.
 ///
-/// Each time the stream ends or raises an error, the error handler will be called and
+/// Each time the stream yields, ends or raises an error, the complete handler will be called and
 /// the stream will be recreated.
 #[derive(Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
@@ -54,27 +54,29 @@ impl<T: Send + Sync + 'static> Drop for Upstre<T> {
     }
 }
 
-pub struct UpstreBuilder<EH, E, EHFut>
+pub struct UpstreBuilder<CH, T, E, CHFut>
 where
-    EH: Fn(Error<E>) -> EHFut + Send + 'static,
+    CH: Fn(Result<Arc<T>, Error<E>>) -> CHFut + Send + 'static,
+    T: Send + Sync + 'static,
     E: Send,
-    EHFut: Future<Output = ()> + Send,
+    CHFut: Future<Output = ()> + Send,
 {
-    error_handler: EH,
+    complete_handler: CH,
     sleep: Duration,
-    _p: PhantomData<(E, EHFut)>,
+    _p: PhantomData<(T, E, CHFut)>,
 }
 
-impl<EH, E, EHFut> UpstreBuilder<EH, E, EHFut>
+impl<CH, T, E, CHFut> UpstreBuilder<CH, T, E, CHFut>
 where
-    EH: Fn(Error<E>) -> EHFut + Send + 'static,
+    CH: Fn(Result<Arc<T>, Error<E>>) -> CHFut + Send + 'static,
+    T: Send + Sync + 'static,
     E: Send,
-    EHFut: Future<Output = ()> + Send,
+    CHFut: Future<Output = ()> + Send,
 {
-    /// The error handler receives errors while [`Stream`] raises error or ends.
-    pub fn new(error_handler: EH) -> Self {
+    /// The complete handler receives value while [`Stream`] yields or ends.
+    pub fn new(complete_handler: CH) -> Self {
         Self {
-            error_handler,
+            complete_handler,
             sleep: DEFAULT_RETRY_GAP,
             _p: PhantomData,
         }
@@ -107,12 +109,11 @@ where
     /// assert_eq!(**place.value(), ());
     /// # })
     /// ```
-    pub async fn build<F, Fut, S, T>(self, stream_maker: F) -> Result<Upstre<T>, Error<E>>
+    pub async fn build<F, Fut, S>(self, stream_maker: F) -> Result<Upstre<T>, Error<E>>
     where
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = Result<S, E>> + Send + 'static,
         S: Stream<Item = Result<T, E>> + Send + 'static,
-        T: Send + Sync + 'static,
     {
         let mut initial_stream = Box::pin(stream_maker().await.map_err(Error::Error)?);
         let initial_value = initial_stream
@@ -130,15 +131,17 @@ where
             loop {
                 let e = match stream.try_next().await {
                     Ok(Some(v)) => {
-                        place_cloned.store(Arc::new(v));
+                        let v = Arc::new(v);
+                        place_cloned.store(v.clone());
+                        (self.complete_handler)(Ok(v));
                         continue;
                     }
                     Ok(None) => Error::EndOfStream,
                     Err(e) => Error::Error(e),
                 };
 
-                // call error handler, usually for logging
-                (self.error_handler)(e).await;
+                // call complete handler, usually for logging
+                (self.complete_handler)(Err(e)).await;
 
                 // prevent busy loop
                 sleep(self.sleep).await;
@@ -147,7 +150,7 @@ where
                     match stream_maker().await {
                         Ok(s) => break Box::pin(s),
                         Err(e) => {
-                            (self.error_handler)(Error::Error(e)).await;
+                            (self.complete_handler)(Err(Error::Error(e))).await;
                             sleep(self.sleep).await;
                         }
                     }
@@ -164,13 +167,14 @@ where
     }
 }
 
-impl<E> Default for UpstreBuilder<fn(Error<E>) -> Ready<()>, E, Ready<()>>
+impl<T, E> Default for UpstreBuilder<fn(Result<Arc<T>, Error<E>>) -> Ready<()>, T, E, Ready<()>>
 where
+    T: Send + Sync + 'static,
     E: Send,
 {
     fn default() -> Self {
         Self {
-            error_handler: |_| ready(()),
+            complete_handler: |_| ready(()),
             sleep: DEFAULT_RETRY_GAP,
             _p: PhantomData,
         }
