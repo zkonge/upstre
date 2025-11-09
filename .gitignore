@@ -1,2 +1,9 @@
 /target
 /Cargo.lock
+
+# Test binaries and build artifacts
+test_*
+*_test
+*.rlib
+async_closure_*
+check_*
