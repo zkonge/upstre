@@ -74,6 +74,33 @@ where
     CHFut: Future<Output = ()> + Send,
 {
     /// The complete handler receives value while [`Stream`] yields or ends.
+    ///
+    /// # Example with async closure
+    ///
+    /// ```rust
+    /// use std::{convert::Infallible, sync::Arc};
+    ///
+    /// use futures_util::stream::{once, Stream};
+    /// use std::future::ready;
+    /// use upstre::{Error, UpstreBuilder};
+    ///
+    /// async fn make_stream() -> Result<impl Stream<Item = Result<i32, Infallible>>, Infallible> {
+    ///     Ok(once(ready(Ok(42))))
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// // Using async closure syntax (stable since Rust 1.85)
+    /// let builder = UpstreBuilder::new(async |result: Result<Arc<i32>, Error<Infallible>>| {
+    ///     match result {
+    ///         Ok(value) => println!("Stream yielded: {}", *value),
+    ///         Err(e) => eprintln!("Stream error: {}", e),
+    ///     }
+    /// });
+    ///
+    /// let upstre = builder.build(make_stream).await.unwrap();
+    /// assert_eq!(**upstre.value(), 42);
+    /// # })
+    /// ```
     pub fn new(complete_handler: CH) -> Self {
         Self {
             complete_handler,
@@ -88,6 +115,8 @@ where
     }
 
     /// Build the [`Upstre`].
+    ///
+    /// # Example with async function
     ///
     /// ```rust
     /// use std::{
@@ -107,6 +136,26 @@ where
     /// let place = UpstreBuilder::default().build(make_stream).await.unwrap();
     ///
     /// assert_eq!(**place.value(), ());
+    /// # })
+    /// ```
+    ///
+    /// # Example with async closure (Rust 1.85+)
+    ///
+    /// ```rust
+    /// use std::convert::Infallible;
+    ///
+    /// use futures_util::stream::once;
+    /// use std::future::ready;
+    /// use upstre::UpstreBuilder;
+    ///
+    /// # tokio_test::block_on(async {
+    /// // Using async closure for stream_maker
+    /// let place = UpstreBuilder::default()
+    ///     .build(async || Ok::<_, Infallible>(once(ready(Ok::<i32, Infallible>(42)))))
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// assert_eq!(**place.value(), 42);
     /// # })
     /// ```
     pub async fn build<F, Fut, S>(self, stream_maker: F) -> Result<Upstre<T>, Error<E>>
