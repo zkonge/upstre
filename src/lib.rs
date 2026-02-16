@@ -1,7 +1,7 @@
 use std::{
     future::{ready, Future, Ready},
     marker::PhantomData,
-    sync::{Arc, Weak},
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,32 +25,19 @@ pub enum Error<E> {
 ///
 /// Each time the stream yields, ends or raises an error, the complete handler will be called and
 /// the stream will be recreated.
-#[derive(Debug)]
+///
+/// [`Upstre`] is cheap to clone, and the clones will share the same value.
+/// When all clones are dropped, the stream will be aborted.
+#[derive(Clone, Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
-    aborter: AbortHandle,
+    _aborter: Arc<CancelOnDrop>,
 }
 
 impl<T: Send + Sync + 'static> Upstre<T> {
     /// Get the last value of the stream.
     pub fn value(&self) -> Guard<Arc<T>> {
         self.place.load()
-    }
-
-    /// Get the container of the last value, preventing the the unnecessary [`Arc`] wrapper.
-    ///
-    /// The [`Arc<Upstre<T>>`] needs 3 dereferences to get the value,
-    /// while the [`Weak<ArcSwap<T>>`] one time less.
-    ///
-    /// But in such case, the [`Weak`] reference is not guaranteed to be valid.
-    pub fn container(&self) -> Weak<ArcSwap<T>> {
-        Arc::downgrade(&self.place)
-    }
-}
-
-impl<T: Send + Sync + 'static> Drop for Upstre<T> {
-    fn drop(&mut self) {
-        self.aborter.abort();
     }
 }
 
@@ -162,7 +149,7 @@ where
 
         Ok(Upstre {
             place,
-            aborter: task.abort_handle(),
+            _aborter: Arc::new(CancelOnDrop(task.abort_handle())),
         })
     }
 }
@@ -178,5 +165,14 @@ where
             sleep: DEFAULT_RETRY_GAP,
             _p: PhantomData,
         }
+    }
+}
+
+#[derive(Debug)]
+struct CancelOnDrop(AbortHandle);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
