@@ -28,7 +28,7 @@ pub enum Error<E> {
 ///
 /// [`Upstre`] is cheap to clone, and the clones will share the same value.
 /// When all clones are dropped, the stream will be aborted.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
     _aborter: Arc<CancelOnDrop>,
@@ -38,6 +38,16 @@ impl<T: Send + Sync + 'static> Upstre<T> {
     /// Get the last value of the stream.
     pub fn value(&self) -> Guard<Arc<T>> {
         self.place.load()
+    }
+}
+
+// derive Clone macro doesn't work with Arc, so we implement it manually.
+impl<T: Send + Sync + 'static> Clone for Upstre<T> {
+    fn clone(&self) -> Self {
+        Self {
+            place: self.place.clone(),
+            _aborter: self._aborter.clone(),
+        }
     }
 }
 
