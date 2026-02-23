@@ -1,6 +1,8 @@
 # Upstre
 
-Upstre is a Rust library for tracking stream value in read-heavy tasks.
+Upstre is a Rust library for tracking the latest value from a stream in read-heavy workloads.
+
+It keeps a shared, atomically updatable value and recreates the stream after errors or completion.
 
 ## Usage
 
@@ -22,5 +24,11 @@ async fn main() {
 }
 ```
 
+## Notes
+
+- Requires a Tokio runtime.
+- Cloned `Upstre` handles share the same latest value.
+- The background task is aborted automatically when all handles are dropped.
+
 ## License
-Apache 2.0 license.
+Licensed under Apache-2.0.

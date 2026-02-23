@@ -1,13 +1,23 @@
 [package]
 name = "upstre"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
+authors = ["Konge <zkonge@outlook.com>"]
+description = "Track the latest value from a stream with automatic retry and shared read access"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["stream", "tokio", "async", "cache"]
+categories = ["asynchronous", "caching"]
+repository = "https://github.com/zkonge/upstre"
 
 [dependencies]
-arc-swap = "1.7.1"
-futures-util = { version = "0.3.31", default-features = false }
-thiserror = { version = "2.0.6", default-features = false }
-tokio = { version = "1.42.0", features = ["rt", "time"] }
+arc-swap = { version = "1.8.2", default-features = false }
+futures-util = { version = "0.3.32", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+tokio = { version = "1.49.0", features = [
+    "rt",
+    "time",
+], default-features = false }
 
 [dev-dependencies]
-tokio-test = "0.4.4"
+tokio-test = "0.4.5"

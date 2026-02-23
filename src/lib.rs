@@ -1,3 +1,16 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs, rust_2018_idioms, unreachable_pub)]
+#![warn(clippy::all, clippy::pedantic, clippy::dbg_macro, clippy::todo)]
+#![allow(clippy::module_name_repetitions)]
+
+//! Keep the latest successful value from a stream in a shared, lock-free container.
+//!
+//! `Upstre` continuously consumes a stream and stores its latest yielded value in
+//! [`ArcSwap`], making reads cheap and wait-free for read-heavy workloads.
+//!
+//! If the stream ends or returns an error, it notifies a completion handler,
+//! sleeps for a configurable interval, and recreates the stream.
+
 use std::{
     future::{ready, Future, Ready},
     marker::PhantomData,
@@ -5,18 +18,25 @@ use std::{
     time::Duration,
 };
 
-pub use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
+pub use arc_swap::Guard;
 use futures_util::{Stream, TryStreamExt};
 use thiserror::Error;
 use tokio::{task::AbortHandle, time::sleep};
 
 const DEFAULT_RETRY_GAP: Duration = Duration::from_secs(1);
 
-/// A consistant type wrapper for [`Option<Result<T, E>>`] in [`Stream`]
+/// Errors returned by [`UpstreBuilder::build`] and reported by callbacks.
+///
+/// This enum unifies stream item errors and stream termination into one type so
+/// callers can handle them consistently.
 #[derive(Error, Debug)]
-pub enum Error<E> {
+pub enum UpstreError<E> {
+    /// The wrapped stream-related error.
     #[error(transparent)]
-    Error(E),
+    Stream(E),
+
+    /// The stream ended without yielding further items.
     #[error("end of stream")]
     EndOfStream,
 }
@@ -31,29 +51,34 @@ pub enum Error<E> {
 #[derive(Debug)]
 pub struct Upstre<T: Send + Sync + 'static> {
     place: Arc<ArcSwap<T>>,
-    _aborter: Arc<CancelOnDrop>,
+    aborter: Arc<AbortOnDrop>,
 }
 
 impl<T: Send + Sync + 'static> Upstre<T> {
     /// Get the last value of the stream.
+    #[must_use]
     pub fn value(&self) -> Guard<Arc<T>> {
         self.place.load()
     }
 }
 
-// derive Clone macro doesn't work with Arc, so we implement it manually.
+// manually implement `Clone` to allow `!Clone` T types.
 impl<T: Send + Sync + 'static> Clone for Upstre<T> {
     fn clone(&self) -> Self {
         Self {
             place: self.place.clone(),
-            _aborter: self._aborter.clone(),
+            aborter: self.aborter.clone(),
         }
     }
 }
 
+/// Builder for creating and running an [`Upstre`].
+///
+/// It controls how often stream recreation is retried and allows attaching an
+/// async completion handler for values and terminal events.
 pub struct UpstreBuilder<CH, T, E, CHFut>
 where
-    CH: Fn(Result<Arc<T>, Error<E>>) -> CHFut + Send + 'static,
+    CH: Fn(Result<Arc<T>, UpstreError<E>>) -> CHFut + Send + 'static,
     T: Send + Sync + 'static,
     E: Send,
     CHFut: Future<Output = ()> + Send,
@@ -65,12 +90,18 @@ where
 
 impl<CH, T, E, CHFut> UpstreBuilder<CH, T, E, CHFut>
 where
-    CH: Fn(Result<Arc<T>, Error<E>>) -> CHFut + Send + 'static,
+    CH: Fn(Result<Arc<T>, UpstreError<E>>) -> CHFut + Send + 'static,
     T: Send + Sync + 'static,
     E: Send,
     CHFut: Future<Output = ()> + Send,
 {
-    /// The complete handler receives value while [`Stream`] yields or ends.
+    /// Create a builder with a completion handler.
+    ///
+    /// The handler is called when:
+    /// - a new value is produced (`Ok(Arc<T>)`),
+    /// - the stream ends (`Err(UpstreError::EndOfStream)`),
+    /// - the stream or stream creation fails (`Err(UpstreError::Stream(_))`).
+    #[must_use]
     pub fn new(complete_handler: CH) -> Self {
         Self {
             complete_handler,
@@ -79,12 +110,21 @@ where
         }
     }
 
-    /// Set the sleep duration between retries.
+    /// Set the sleep duration between retry attempts.
+    #[must_use]
     pub fn sleep(self, dur: Duration) -> Self {
         Self { sleep: dur, ..self }
     }
 
     /// Build the [`Upstre`].
+    ///
+    /// This method waits for the first stream item to initialize storage. If the
+    /// first stream is empty, it returns [`UpstreError::EndOfStream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpstreError::Stream`] if stream creation or polling fails.
+    /// Returns [`UpstreError::EndOfStream`] if the stream yields no item.
     ///
     /// ```rust
     /// use std::{
@@ -106,18 +146,18 @@ where
     /// assert_eq!(**place.value(), ());
     /// # })
     /// ```
-    pub async fn build<F, Fut, S>(self, stream_maker: F) -> Result<Upstre<T>, Error<E>>
+    pub async fn build<F, Fut, S>(self, stream_maker: F) -> Result<Upstre<T>, UpstreError<E>>
     where
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = Result<S, E>> + Send + 'static,
         S: Stream<Item = Result<T, E>> + Send + 'static,
     {
-        let mut initial_stream = Box::pin(stream_maker().await.map_err(Error::Error)?);
+        let mut initial_stream = Box::pin(stream_maker().await.map_err(UpstreError::Stream)?);
         let initial_value = initial_stream
             .try_next()
             .await
-            .map_err(Error::Error)?
-            .ok_or(Error::EndOfStream)?;
+            .map_err(UpstreError::Stream)?
+            .ok_or(UpstreError::EndOfStream)?;
 
         let place = Arc::new(ArcSwap::from_pointee(initial_value));
         let place_cloned = place.clone();
@@ -130,11 +170,11 @@ where
                     Ok(Some(v)) => {
                         let v = Arc::new(v);
                         place_cloned.store(v.clone());
-                        (self.complete_handler)(Ok(v));
+                        (self.complete_handler)(Ok(v)).await;
                         continue;
                     }
-                    Ok(None) => Error::EndOfStream,
-                    Err(e) => Error::Error(e),
+                    Ok(None) => UpstreError::EndOfStream,
+                    Err(e) => UpstreError::Stream(e),
                 };
 
                 // call complete handler, usually for logging
@@ -147,7 +187,7 @@ where
                     match stream_maker().await {
                         Ok(s) => break Box::pin(s),
                         Err(e) => {
-                            (self.complete_handler)(Err(Error::Error(e))).await;
+                            (self.complete_handler)(Err(UpstreError::Stream(e))).await;
                             sleep(self.sleep).await;
                         }
                     }
@@ -159,12 +199,13 @@ where
 
         Ok(Upstre {
             place,
-            _aborter: Arc::new(CancelOnDrop(task.abort_handle())),
+            aborter: Arc::new(AbortOnDrop(task.abort_handle())),
         })
     }
 }
 
-impl<T, E> Default for UpstreBuilder<fn(Result<Arc<T>, Error<E>>) -> Ready<()>, T, E, Ready<()>>
+impl<T, E> Default
+    for UpstreBuilder<fn(Result<Arc<T>, UpstreError<E>>) -> Ready<()>, T, E, Ready<()>>
 where
     T: Send + Sync + 'static,
     E: Send,
@@ -178,10 +219,11 @@ where
     }
 }
 
+/// Aborts a background task when it is dropped.
 #[derive(Debug)]
-struct CancelOnDrop(AbortHandle);
+struct AbortOnDrop(AbortHandle);
 
-impl Drop for CancelOnDrop {
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
